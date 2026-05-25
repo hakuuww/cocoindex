@@ -34,3 +34,4 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 axum = { workspace = true }
+tempfile = "3"
