@@ -9,7 +9,9 @@ use crate::engine::context::{
     ComponentProcessingAction, ComponentProcessingMode, ComponentProcessorContext,
     DeclaredTargetState, MemoStatesPayload, TARGET_ID_KEY,
 };
-use crate::engine::context::{FnCallContext, FnCallMemoEntry, FnMemoCache, decode_stored_entry};
+use crate::engine::context::{
+    FnCallContext, FnCallMemoEntry, FnMemoCache, UserStateCache, decode_stored_entry,
+};
 use crate::engine::id_sequencer::IdReservation;
 use crate::engine::logic_registry;
 use crate::engine::profile::{EngineProfile, Persist};
@@ -319,6 +321,7 @@ impl<Prof: EngineProfile> Committer<Prof> {
         wtxn: &mut WriteTxn<'_>,
         child_path_set: Option<ChildStablePathSet>,
         fn_memos: FnMemoCache<Prof>,
+        user_states: UserStateCache,
         curr_version: Option<u64>,
     ) -> Result<Self> {
         {
@@ -413,6 +416,12 @@ impl<Prof: EngineProfile> Committer<Prof> {
                 .flush_to_db(wtxn, &self.app_store, &self.component_path)
                 .await?;
 
+            // Flush user-state cache: set-reduction when prefetched, delete-all
+            // + write when full_reprocess or delete mode (empty cache).
+            user_states
+                .flush_to_db(wtxn, &self.app_store, &self.component_path)
+                .await?;
+
             if !self.demote_component_only {
                 self.update_existence(&mut *wtxn, child_path_set).await?;
             }
@@ -425,6 +434,7 @@ impl<Prof: EngineProfile> Committer<Prof> {
         self,
         child_path_set: Option<ChildStablePathSet>,
         fn_memos: FnMemoCache<Prof>,
+        user_states: UserStateCache,
         curr_version: Option<u64>,
     ) -> Result<()> {
         // Single cheap Arc clone so we can call run_txn() / read_txn() after self moves into the closure.
@@ -433,7 +443,7 @@ impl<Prof: EngineProfile> Committer<Prof> {
             .env()
             .run_txn(move |wtxn| {
                 Box::pin(async move {
-                    self.commit_in_txn(wtxn, child_path_set, fn_memos, curr_version)
+                    self.commit_in_txn(wtxn, child_path_set, fn_memos, user_states, curr_version)
                         .await
                 })
             })
@@ -1310,6 +1320,7 @@ pub(crate) async fn submit<Prof: EngineProfile>(
         declared_target_states,
         child_path_set,
         fn_memos,
+        user_states,
         contained_target_state_paths,
     ) = match comp_ctx.processing_state() {
         ComponentProcessingAction::Build(build_ctx) => {
@@ -1327,6 +1338,7 @@ pub(crate) async fn submit<Prof: EngineProfile>(
 
             let child_path_set = building_state.child_path_set;
             let fn_memos = building_state.fn_memos;
+            let user_states = building_state.user_states;
             let contained_target_state_paths = finalize_fn_call_memoization(comp_ctx, &fn_memos)?;
             (
                 &built_target_states_providers
@@ -1335,6 +1347,7 @@ pub(crate) async fn submit<Prof: EngineProfile>(
                 building_state.target_states.declared_target_states,
                 Some(child_path_set),
                 fn_memos,
+                user_states,
                 contained_target_state_paths,
             )
         }
@@ -1343,6 +1356,7 @@ pub(crate) async fn submit<Prof: EngineProfile>(
             Default::default(),
             None,
             FnMemoCache::default(),
+            UserStateCache::new(),
             HashSet::new(),
         ),
     };
@@ -1484,7 +1498,7 @@ pub(crate) async fn submit<Prof: EngineProfile>(
         let committer =
             Committer::new(comp_ctx, &target_states_providers, demote_component_only)?;
         committer
-            .commit(child_path_set, fn_memos, curr_version)
+            .commit(child_path_set, fn_memos, user_states, curr_version)
             .await?;
         Ok::<_, Error>(())
     }
