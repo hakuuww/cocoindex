@@ -469,21 +469,6 @@ impl AppStore {
 // --- Function memoization ------------------------------------------------
 
 impl AppStore {
-    /// List every function memo under `path` from a fresh snapshot. Used
-    /// by the per-component `fn_memos` loader outside `run_txn`.
-    pub async fn list_fn_memos(&self, path: &StablePath) -> Result<Vec<(Fingerprint, Vec<u8>)>> {
-        let rtxn = self.read_txn().await?;
-        let prefix = key_fn_memo_prefix(path)?;
-        let db = self.db();
-        let mut out = Vec::new();
-        for entry in db.prefix_iter(&rtxn, &prefix)? {
-            let (raw_key, raw_val) = entry?;
-            let fp: Fingerprint = storekey::decode(raw_key[prefix.len()..].as_ref())?;
-            out.push((fp, raw_val.to_vec()));
-        }
-        Ok(out)
-    }
-
     pub async fn write_fn_memo(
         &self,
         txn: &mut WriteTxn<'_>,
@@ -879,6 +864,48 @@ impl AppStore {
             }
         }
         Ok(())
+    }
+}
+
+// --- Combined prefetch read ----------------------------------------------
+
+impl AppStore {
+    /// List every function-memo and user-state entry under `path` from a
+    /// single read snapshot. Used by the per-component prefetch
+    /// ([`crate::engine::context::ComponentProcessorContext::prefetch_states`]).
+    ///
+    /// Both ranges are read under one `RoTxn` rather than two. Under
+    /// `MDB_NOTLS` each read-txn begin takes the reader-table mutex, so a
+    /// single snapshot halves that cost — most visibly when many child
+    /// components prefetch concurrently during `mount_each` fan-out — and
+    /// halves concurrent reader-slot occupancy against the
+    /// `MDB_READERS_FULL` limit.
+    pub async fn list_fn_memos_and_user_states(
+        &self,
+        path: &StablePath,
+    ) -> Result<(Vec<(Fingerprint, Vec<u8>)>, Vec<(StableKey, Vec<u8>)>)> {
+        let rtxn = self.read_txn().await?;
+        let db = self.db();
+
+        // Function memos, keyed by fingerprint.
+        let fp_prefix = key_fn_memo_prefix(path)?;
+        let mut memos = Vec::new();
+        for entry in db.prefix_iter(&rtxn, &fp_prefix)? {
+            let (raw_key, raw_val) = entry?;
+            let fp: Fingerprint = storekey::decode(raw_key[fp_prefix.len()..].as_ref())?;
+            memos.push((fp, raw_val.to_vec()));
+        }
+
+        // User states, keyed by stable key.
+        let us_prefix = key_user_state_prefix(path)?;
+        let mut states = Vec::new();
+        for entry in db.prefix_iter(&rtxn, &us_prefix)? {
+            let (raw_key, raw_val) = entry?;
+            let user_key: StableKey = storekey::decode(raw_key[us_prefix.len()..].as_ref())?;
+            states.push((user_key, raw_val.to_vec()));
+        }
+
+        Ok((memos, states))
     }
 }
 

@@ -261,7 +261,7 @@ impl<Prof: EngineProfile> FnMemoCache<Prof> {
 
     /// Insert prefetched rows from the database into the cache and mark it
     /// fully loaded. The async I/O lives at the context layer
-    /// ([`ComponentProcessorContext::prefetch_fn_memos`]); this is the sync
+    /// ([`ComponentProcessorContext::prefetch_states`]); this is the sync
     /// half that runs under the building-state mutex.
     pub(crate) fn populate(&mut self, rows: Vec<(Fingerprint, Vec<u8>)>) {
         for (fp, bytes) in rows {
@@ -752,69 +752,46 @@ impl<Prof: EngineProfile> ComponentProcessorContext<Prof> {
         self.inner.component.stable_path()
     }
 
-    /// Eagerly load every function-memo entry for this component from
-    /// storage into the per-build cache. Called at the start of build mode
-    /// before any function calls run; skipped under `full_reprocess` so
-    /// the cache stays empty and `into_flush_plan` produces a clear-all
-    /// plan followed by writes of newly-computed entries.
-    pub(crate) async fn prefetch_fn_memos(&self) -> Result<()> {
+    /// Eagerly load every function-memo and user-state entry for this
+    /// component from storage into the per-build cache. Called at the start
+    /// of build mode before any function calls run, so every subsequent
+    /// fn-call probe and `use_state` serves from memory. Skipped under
+    /// `full_reprocess` so both caches stay empty and `into_flush_plan`
+    /// produces a clear-all plan followed by writes of newly-computed entries.
+    ///
+    /// Both ranges are read under a single LMDB read transaction: under
+    /// `MDB_NOTLS` every read-txn begin takes the reader-table mutex, so
+    /// one snapshot instead of two halves that cost — most visibly during
+    /// `mount_each` fan-out, where many child components prefetch at once
+    /// (it also halves concurrent reader-slot occupancy against LMDB's
+    /// `MDB_READERS_FULL` limit).
+    pub(crate) async fn prefetch_states(&self) -> Result<()> {
         if self.full_reprocess() {
             return Ok(());
         }
-        // Cheap check: skip if already loaded (re-entry, etc.).
+        // Cheap check: skip if already loaded (re-entry, etc.). The two
+        // caches are always prefetched together, so they load as a pair.
         let already_loaded = match &self.inner.processing_action {
             ComponentProcessingAction::Build(build_ctx) => {
                 let guard = build_ctx.state.lock().unwrap();
                 let Some(state) = guard.as_ref() else {
                     return Ok(());
                 };
-                state.fn_memos.is_fully_loaded()
+                state.fn_memos.is_fully_loaded() && state.user_states.is_loaded()
             }
             ComponentProcessingAction::Delete { .. } => return Ok(()),
         };
         if already_loaded {
             return Ok(());
         }
-        let app_store = self.app_ctx().app_store();
-        let path = self.stable_path();
-        let rows = app_store.list_fn_memos(path).await?;
-        self.update_building_state(|s| {
-            s.fn_memos.populate(rows);
-            Ok(())
-        })
-    }
-
-    /// Eagerly load every user-state entry for this component from storage
-    /// into the per-build cache. Mirrors `prefetch_fn_memos`; skipped under
-    /// `full_reprocess` so `into_flush_plan` produces a clear-all plan
-    /// followed by writes of the newly-declared entries.
-    pub(crate) async fn prefetch_user_states(&self) -> Result<()> {
-        if self.full_reprocess() {
-            return Ok(());
-        }
-
-        // Cheap check: skip if already loaded (re-entry, etc.).
-        let already_loaded = match &self.inner.processing_action {
-            ComponentProcessingAction::Build(build_ctx) => {
-                let guard = build_ctx.state.lock().unwrap();
-                let Some(state) = guard.as_ref() else {
-                    return Ok(());
-                };
-                state.user_states.is_loaded()
-            }
-            ComponentProcessingAction::Delete { .. } => return Ok(()),
-        };
-        if already_loaded {
-            return Ok(());
-        }
-
-        let rows = self
+        let (fn_memo_rows, user_state_rows) = self
             .app_ctx()
             .app_store()
-            .list_user_states(self.stable_path())
+            .list_fn_memos_and_user_states(self.stable_path())
             .await?;
         self.update_building_state(|s| {
-            s.user_states.populate(rows);
+            s.fn_memos.populate(fn_memo_rows);
+            s.user_states.populate(user_state_rows);
             Ok(())
         })
     }
